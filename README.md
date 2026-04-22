@@ -387,4 +387,4 @@ Run individual scripts with debug output to troubleshoot issues.
 
 ## License
 
-[Specify license here, e.g., MIT License]
+MIT License]
