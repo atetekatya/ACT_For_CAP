@@ -23,5 +23,6 @@ python-dotenv
 sentence-transformers
 ratelimit
 pydantic
+pdfminer.six
 pytest
 bibtexparser

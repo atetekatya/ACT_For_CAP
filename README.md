@@ -43,12 +43,13 @@ An NLP-assisted pipeline that detects keyword redundancy within SHU's course cat
 2. **Set Up Virtual Environment**:
    ```bash
    python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   source .venv/bin/activate  
    ```
 
 3. **Install Dependencies**:
    ```bash
    pip install -r requirements.txt
+   pip install sentence-transformers 
    ```
 
 4. **Download Required NLP Models**:
@@ -170,7 +171,6 @@ The pipeline uses default settings but can be customized by modifying the indivi
 - Scraping parameters in scraping scripts
 - Report templates in `08_report.py`
 
-## Troubleshooting
 
 ### Common Issues
 
@@ -196,19 +196,6 @@ Run individual scripts with debug output to troubleshoot issues.
 [Specify license here, e.g., MIT License]
 An NLP-assisted pipeline that detects keyword redundancy within SHU's course catalog and compares SHU course descriptions against four peer institutions to surface terminology misalignments.
 
-## Table of Contents
-
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Project Structure](#project-structure)
-- [Data](#data)
-- [Outputs](#outputs)
-- [Configuration](#configuration)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## Features
 
@@ -280,20 +267,6 @@ This will execute all steps in sequence:
   python run_pipeline.py --skip-scrape
   ```
 
-### Running Individual Scripts
-
-You can run individual pipeline steps manually:
-
-```bash
-python 01_ingest_shu.py
-python 02_scrape_chatham.py
-python 03_scrape_pointpark.py
-python 04_parse_stvincent.py
-python 05_parse_iup.py
-python 06_build_database.py
-python 07_analyze.py
-python 08_report.py
-```
 
 ### Viewing the Report
 
@@ -301,40 +274,6 @@ After running the pipeline, open the generated report:
 
 ```bash
 open output/ACT_for_CAP_Report.html
-```
-
-## Project Structure
-
-```
-ACT_For_CAP/
-├── 01_ingest_shu.py          # SHU catalog ingestion
-├── 02_scrape_chatham.py      # Chatham University scraping
-├── 03_scrape_pointpark.py    # Point Park University scraping
-├── 04_parse_stvincent.py     # Saint Vincent College parsing
-├── 05_parse_iup.py           # IUP parsing
-├── 06_build_database.py      # Database and CSV creation
-├── 07_analyze.py             # NLP analysis
-├── 08_report.py              # Report generation
-├── run_pipeline.py           # Master pipeline runner
-├── requirements.txt           # Python dependencies
-├── manual_entry_template.py   # Template for manual data entry
-├── debug_*.txt               # Debug output files
-├── data/
-│   ├── raw/                  # Raw scraped/parsed data
-│   │   └── SHU_catalog.csv
-│   └── processed/            # Processed course data
-│       ├── all_courses.csv
-│       ├── Chatham_courses.json
-│       ├── IUP_courses.json
-│       ├── PointPark_courses.json
-│       ├── SHU_courses.json
-│       └── StVincent_courses.json
-└── output/
-    ├── ACT_for_CAP_Report.html
-    ├── cross_institution_matches.csv
-    ├── keyword_frequencies.csv
-    ├── shu_redundant_pairs.csv
-    └── similarity_stats.json
 ```
 
 ## Data
@@ -377,14 +316,7 @@ The pipeline uses default settings but can be customized by modifying the indivi
 
 Run individual scripts with debug output to troubleshoot issues.
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
 
 ## License
 
-MIT License]
+MIT License
