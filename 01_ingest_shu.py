@@ -35,7 +35,7 @@ def parse_department(course_code: str) -> str:
 
 def main():
     courses = []
-    with open(RAW_PATH, newline='', encoding='utf-8', errors='replace') as f:
+    with open(RAW_PATH, newline='', encoding='utf-8-sig', errors='replace') as f:
         reader = csv.DictReader(f)
         for row in reader:
             code  = row.get("course code", "").strip()

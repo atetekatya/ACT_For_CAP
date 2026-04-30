@@ -3,7 +3,13 @@
 Downloads and parses the Saint Vincent College undergraduate catalog PDF:
   https://www.stvincent.edu/assets/docs/default-library/2025-2026-Catalog-Undergraduate-and-Graduate.pdf
 
-Uses pdfminer.six for text extraction, then heuristic parsing.
+Uses pdfminer.six for text extraction, then a scan-based heuristic parser
+tailored to SVC's format:
+  - Course codes: DEPT-NNN[suffix]   (e.g. AN-101, BL-150, MA-109)
+  - Titles: ALL UPPERCASE, no separator before the description
+  - Description starts at the first capital+lowercase pair after the title
+  - Credits appear at the end of each description: "3 credits" or "3 credits."
+
 Outputs: data/processed/StVincent_courses.json
 
 NOTE: If the PDF download fails (network restrictions), place the PDF manually at:
@@ -11,134 +17,123 @@ NOTE: If the PDF download fails (network restrictions), place the PDF manually a
 and re-run this script.
 """
 
-import json, re, os, io
-import requests
-from pdfminer.high_level import extract_text_to_fp
-from pdfminer.layout import LAParams
+import json, re, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pdf_utils import download_pdf, extract_text_from_pdf
 
 PDF_URL  = "https://www.stvincent.edu/assets/docs/default-library/2025-2026-Catalog-Undergraduate-and-Graduate.pdf"
 PDF_PATH = "data/raw/StVincent_catalog.pdf"
 OUT_PATH = "data/processed/StVincent_courses.json"
 
-HEADERS   = {"User-Agent": "Mozilla/5.0 (academic research project)"}
-# Matches lines like:  "ART 101  Introduction to Art  3 credits"
-# or block headings like "ART 101. Introduction to Art."
+
+# Course header: DEPT-NNN[suffix] TITLE_IN_CAPS
+# Title boundary: lazy match of uppercase letters / spaces / common punctuation,
+# terminated by lookahead to a capital+lowercase pair (start of description) OR end.
 COURSE_HEADER_RE = re.compile(
-    r'^([A-Z]{2,6})\s+(\d{3,4}[A-Z]?)[.\s]+(.+?)(?:\s+(\d+(?:\.\d+)?)\s+[Cc]redit)?\.?\s*$'
+    r'([A-Z]{1,4})-(\d{3,4}[A-Z]?)\s+'           # CODE: AN-101, BL-150A, etc.
+    r'([A-Z][A-Z0-9 \t\n&/.,;:\'"\-]+?)'          # TITLE: caps + symbols + whitespace, lazy
+    r'\s*(?=[A-Z][a-z]|\Z)'                       # trailing ws + lookahead to sentence start
 )
-CREDIT_RE = re.compile(r'\b(\d+(?:\.\d+)?)\s+[Cc]redit', re.IGNORECASE)
+CREDIT_ANCHOR_RE = re.compile(
+    r'\b(\d+(?:\.\d+)?)\s+credits?\b'
+    r'|credits?\s*[:\-]\s*(\d+(?:\.\d+)?)'
+    r'|\((\d+(?:\.\d+)?)\s*(?:credits?|cr)\)',
+    re.IGNORECASE
+)
+SECTION_ANCHOR_RE = re.compile(r'Course\s+Descriptions?', re.IGNORECASE)
+# Inside a title, this catches references to other courses (degree-audit
+# listings). Real course titles have zero such references.
+CODE_REF_IN_TITLE_RE = re.compile(r'\b[A-Z]{2,4}[\s\-]?\d{3,4}[A-Z]?\b')
+DESC_CAP = 4000
 
 
-def download_pdf(url: str, dest: str):
-    """Download PDF to dest path if not already present."""
-    if os.path.exists(dest):
-        print(f"  PDF already exists at {dest}, skipping download.")
-        return True
-    print(f"  Downloading PDF from {url} ...")
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=120, stream=True)
-        resp.raise_for_status()
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        size_mb = os.path.getsize(dest) / 1e6
-        print(f"  Downloaded {size_mb:.1f} MB")
-        return True
-    except Exception as e:
-        print(f"  ✗ Download failed: {e}")
-        return False
+def _find_section_start(text: str) -> int:
+    """
+    Return the offset of the first real course header inside the courses section.
+
+    Strategy: walk every "Course Descriptions" occurrence from last to first.
+    The actual section header is the latest mention that has a course-code
+    pattern within ~500 chars after it (TOC entries don't). Page numbers and
+    other layout junk between the heading and the first course are tolerated
+    via the windowed search.
+    """
+    candidates = list(SECTION_ANCHOR_RE.finditer(text))
+    for cand in reversed(candidates):
+        window = text[cand.end():cand.end() + 500]
+        first_course = COURSE_HEADER_RE.search(window)
+        if first_course:
+            return cand.end() + first_course.start()
+    return -1
 
 
-def extract_text_from_pdf(path: str) -> str:
-    """Extract all text from a PDF using pdfminer."""
-    output = io.StringIO()
-    laparams = LAParams(line_margin=0.5, word_margin=0.1)
-    with open(path, "rb") as f:
-        extract_text_to_fp(f, output, laparams=laparams)
-    return output.getvalue()
+def _find_credits(s: str) -> str:
+    m = CREDIT_ANCHOR_RE.search(s or "")
+    if not m:
+        return ""
+    for g in m.groups():
+        if g:
+            return g
+    return ""
 
 
 def parse_courses(text: str, institution: str = "Saint Vincent College") -> list[dict]:
     """
-    Heuristic parser for academic catalog text.
-    Looks for lines that start with a course code pattern (3-6 uppercase letters + 3-4 digit number).
-    Everything after that line until the next course code is treated as the description.
+    Scan-based SVC catalog parser.
+
+    Anchors at "Course Descriptions" (immediately followed by a course code), then
+    scans the body for every CODE-NNN TITLE pattern. The text between consecutive
+    matches is the description for the previous course. Descriptions are capped
+    at DESC_CAP characters.
     """
+    start = _find_section_start(text)
+    if start >= 0:
+        body = text[start:]
+        print(f"  Section start located at offset {start:,} — scanning {len(body):,} chars")
+    else:
+        body = text
+        print("  ⚠️  Could not locate Course Descriptions section — scanning full text")
+
+    matches = list(COURSE_HEADER_RE.finditer(body))
+    print(f"  Found {len(matches)} course-header matches")
+
     courses = []
-    lines = text.splitlines()
+    skipped_audit = 0
+    for idx, m in enumerate(matches):
+        dept  = m.group(1)
+        num   = m.group(2)
+        title = re.sub(r'\s+', ' ', m.group(3)).strip(" -:.,;")
 
-    current_code  = ""
-    current_title = ""
-    current_dept  = ""
-    desc_parts    = []
-
-    def flush():
-        nonlocal current_code, current_title, current_dept, desc_parts
-        if current_title or current_code:
-            desc = " ".join(desc_parts).strip()
-            # Clean up common PDF artifacts
-            desc = re.sub(r'\s+', ' ', desc)
-            desc = re.sub(r'[^\x20-\x7E\u00A0-\u024F]', ' ', desc)
-            courses.append({
-                "institution":  institution,
-                "course_code":  current_code,
-                "course_title": current_title,
-                "description":  desc,
-                "credits":      extract_credits(current_title + " " + desc),
-                "department":   current_dept,
-                "active":       True,
-            })
-        current_code  = ""
-        current_title = ""
-        current_dept  = ""
-        desc_parts    = []
-
-    def extract_credits(text: str) -> str:
-        m = CREDIT_RE.search(text or "")
-        return m.group(1) if m else ""
-
-    # Only process lines within the "Courses" section of the catalog
-    in_courses_section = False
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
+        # Drop degree-audit listings — real titles are English phrases, never a
+        # list of course codes. Audit "titles" carry ≥2 code references.
+        if len(CODE_REF_IN_TITLE_RE.findall(title)) >= 2:
+            skipped_audit += 1
             continue
 
-        # Detect start of course listings section
-        if re.match(r'^(Courses?|Course Descriptions?|Course Listings?)\s*$', stripped, re.I):
-            in_courses_section = True
-            continue
+        desc_start = m.end()
+        desc_end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
+        desc = body[desc_start:desc_end]
 
-        # Detect chapter/section headers that signal end of course listings
-        if in_courses_section and re.match(
-            r'^(Appendix|Index|Faculty|Administration|Financial|Academic Policies|Accreditation)',
-            stripped, re.I
-        ):
-            in_courses_section = False
+        # Normalize whitespace, drop control chars (keep Latin-1 punctuation)
+        desc = re.sub(r'[^\x20-\x7E -ɏ]', ' ', desc)
+        desc = re.sub(r'\s+', ' ', desc).strip()
+        if len(desc) > DESC_CAP:
+            desc = desc[:DESC_CAP].rsplit(' ', 1)[0] + ' ...'
 
-        # Match course code line regardless of section (PDFs often lack clear section markers)
-        m = re.match(r'^([A-Z]{2,6})\s{1,5}(\d{3,4}[A-Z]?)[.\s:–-]+(.{3,80})$', stripped)
-        if m:
-            flush()
-            in_courses_section = True
-            dept         = m.group(1)
-            num          = m.group(2)
-            rest         = m.group(3).strip(" .-()")
-            current_code  = f"{dept} {num}"
-            current_dept  = dept
-            current_title = rest
-        elif in_courses_section and current_code:
-            # Continuation line — part of description
-            # Skip obvious page headers/footers
-            if re.match(r'^\d+\s*$', stripped):
-                continue
-            if len(stripped) < 4:
-                continue
-            desc_parts.append(stripped)
+        credits = _find_credits(desc) or _find_credits(title)
 
-    flush()
+        courses.append({
+            "institution":  institution,
+            "course_code":  f"{dept}-{num}",
+            "course_title": title,
+            "description":  desc,
+            "credits":      credits,
+            "department":   dept,
+            "active":       True,
+        })
+
+    if skipped_audit:
+        print(f"  Filtered out {skipped_audit} degree-audit entries")
     return courses
 
 
@@ -146,7 +141,6 @@ def main():
     os.makedirs("data/raw", exist_ok=True)
     os.makedirs("data/processed", exist_ok=True)
 
-    # Try to download PDF
     if not download_pdf(PDF_URL, PDF_PATH):
         print("⚠️  PDF not available. Place it manually at:", PDF_PATH)
         print("   Then re-run this script.")

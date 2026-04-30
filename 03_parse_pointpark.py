@@ -10,45 +10,16 @@ NOTE: If the PDF download fails, place the file manually at:
 and re-run.
 """
 
-import json, re, os, io
-import requests
-from pdfminer.high_level import extract_text_to_fp
-from pdfminer.layout import LAParams
+import json, re, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pdf_utils import download_pdf, extract_text_from_pdf
 
 PDF_URL  = "https://www.pointpark.edu/about/admindepts/academicandstudent/universitycatalogs/point-park-undergrad-catalog.pdf"
 PDF_PATH = "data/raw/PointPark_catalog.pdf"
 OUT_PATH = "data/processed/PointPark_courses.json"
 
-HEADERS   = {"User-Agent": "Mozilla/5.0 (academic research project)"}
 CREDIT_RE = re.compile(r'\b(\d+(?:\.\d+)?)\s+[Cc]redit', re.IGNORECASE)
-
-
-def download_pdf(url: str, dest: str) -> bool:
-    if os.path.exists(dest):
-        print(f"  PDF already exists at {dest}, skipping download.")
-        return True
-    print(f"  Downloading PDF from {url} ...")
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=120, stream=True)
-        resp.raise_for_status()
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        size_mb = os.path.getsize(dest) / 1e6
-        print(f"  Downloaded {size_mb:.1f} MB")
-        return True
-    except Exception as e:
-        print(f"  ✗ Download failed: {e}")
-        return False
-
-
-def extract_text_from_pdf(path: str) -> str:
-    output = io.StringIO()
-    laparams = LAParams(line_margin=0.5, word_margin=0.1)
-    with open(path, "rb") as f:
-        extract_text_to_fp(f, output, laparams=laparams)
-    return output.getvalue()
 
 
 def parse_courses(text: str) -> list[dict]:

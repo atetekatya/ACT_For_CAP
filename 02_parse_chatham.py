@@ -10,243 +10,98 @@ NOTE: If the PDF download fails, place the file manually at:
 and re-run.
 """
 
-import json, re, os, io
-import requests
-from pdfminer.high_level import extract_text_to_fp
-from pdfminer.layout import LAParams
+import json, re, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pdf_utils import download_pdf, extract_text_from_pdf
 
 PDF_URL  = "https://www.chatham.edu/_documents/_academics/catalogs/chatham-university-catalog-2025-2026.pdf"
 PDF_PATH = "data/raw/Chatham_catalog.pdf"
 OUT_PATH = "data/processed/Chatham_courses.json"
 
-HEADERS   = {"User-Agent": "Mozilla/5.0 (academic research project)"}
-CREDIT_RE = re.compile(r'\b(\d+(?:\.\d+)?)\s+[Cc]redit', re.IGNORECASE)
 
-
-def download_pdf(url: str, dest: str) -> bool:
-    if os.path.exists(dest):
-        print(f"  PDF already exists at {dest}, skipping download.")
-        return True
-    print(f"  Downloading PDF from {url} ...")
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=120, stream=True)
-        resp.raise_for_status()
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        size_mb = os.path.getsize(dest) / 1e6
-        print(f"  Downloaded {size_mb:.1f} MB")
-        return True
-    except Exception as e:
-        print(f"  ✗ Download failed: {e}")
-        return False
-
-
-def extract_text_from_pdf(path: str) -> str:
-    output = io.StringIO()
-    laparams = LAParams(line_margin=0.5, word_margin=0.1)
-    with open(path, "rb") as f:
-        extract_text_to_fp(f, output, laparams=laparams)
-    return output.getvalue()
+# Course header: DEPT###[suffix] Title (credits)
+# pdfminer often produces no separator between the previous block (department
+# header, page footer) and the course code — so we don't anchor at line start.
+COURSE_HEADER_RE = re.compile(
+    r'([A-Z]{2,6})(\d{3,4}[A-Z]?)\s+'        # CODE (no space between letters and digits)
+    r'([A-Za-z][^()\n]{2,140}?)'              # title (lazy, no parens or newlines)
+    r'\s*\((\d+(?:\.\d+)?)\)'                 # (credits)
+)
+DEPT_HEADER_RE = re.compile(
+    r'([A-Z]{2,6}):\s+([A-Z][A-Z &,/.\-]+?)(?=[A-Z]{2,6}\d{3,4}|[a-z])'
+)
+PAGE_FOOTER_RE = re.compile(
+    r'(?:COURSE\s*DESCRIPTIONS?)?\s*CHATHAM\s+UNIVERSITY\s+CATALOG[:\s]*\d{4}-\d{4}\s*\d+',
+    re.IGNORECASE
+)
+DESC_CAP = 4000
 
 
 def parse_courses(text: str) -> list[dict]:
+    """
+    Scan-based parser for the Chatham catalog. Course headers can appear anywhere
+    in the extracted text (not just at line starts) because pdfminer concatenates
+    department headers and page footers without separators. We locate every header
+    via finditer; the text between consecutive headers is the previous course's
+    description.
+    """
+    anchor = re.search(r'COURSE\s*DESCRIPTIONS?', text, re.IGNORECASE)
+    if anchor:
+        body = text[anchor.end():]
+    else:
+        print("⚠️  'COURSE DESCRIPTIONS' anchor not found — scanning full text")
+        body = text
+
+    # Sorted list of (position, dept_code, dept_name) so each course can be
+    # attributed to the most-recent department header preceding it.
+    dept_positions = [
+        (m.start(), m.group(1), m.group(2).strip())
+        for m in DEPT_HEADER_RE.finditer(body)
+    ]
+
+    def dept_at(pos: int):
+        active = ("", "")
+        for p, code, name in dept_positions:
+            if p <= pos:
+                active = (code, name)
+            else:
+                break
+        return active
+
+    matches = list(COURSE_HEADER_RE.finditer(body))
     courses = []
-    lines = text.splitlines()
+    for idx, m in enumerate(matches):
+        dept_code = m.group(1)
+        num       = m.group(2)
+        title     = m.group(3).strip(" -:.")
+        credits   = m.group(4)
 
-    current_code  = ""
-    current_title = ""
-    current_dept  = ""
-    current_dept_name = ""
-    desc_parts    = []
-    credits = ""
+        desc_start = m.end()
+        desc_end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
+        desc = body[desc_start:desc_end]
 
-    def flush():
-        nonlocal current_code, current_title, current_dept, current_dept_name, desc_parts, credits
-        if current_title or current_code:
-            desc = " ".join(desc_parts).strip()
-            desc = re.sub(r'\s+', ' ', desc)
-            desc = re.sub(r'[^\x20-\x7E\u00A0-\u024F]', ' ', desc)
-            courses.append({
-                "institution":  "Chatham University",
-                "course_code":  current_code,
-                "course_title": current_title,
-                "description":  desc,
-                "credits":      credits,
-                "department":   current_dept,
-                "department_name": current_dept_name,
-                "active":       True,
-            })
-        current_code  = ""
-        current_title = ""
-        current_dept  = ""
-        current_dept_name = ""
-        desc_parts    = []
-        credits = ""
+        desc = PAGE_FOOTER_RE.sub(' ', desc)
+        desc = re.sub(r'[^\x20-\x7E -ɏ]', ' ', desc)
+        desc = re.sub(r'\s+', ' ', desc).strip()
+        if len(desc) > DESC_CAP:
+            desc = desc[:DESC_CAP].rsplit(' ', 1)[0] + ' ...'
 
-    in_courses_section = False
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if not stripped:
-            i += 1
-            continue
+        dept, dept_name = dept_at(m.start())
+        if not dept:
+            dept = dept_code
 
-        # Detect start of course listings section
-        if re.match(r'^(Courses?|Course Descriptions?|Course Listings?)\s*$', stripped, re.I):
-            in_courses_section = True
-            i += 1
-            continue
+        courses.append({
+            "institution":     "Chatham University",
+            "course_code":     f"{dept_code} {num}",
+            "course_title":    title,
+            "description":     desc,
+            "credits":         credits,
+            "department":      dept,
+            "department_name": dept_name,
+            "active":          True,
+        })
 
-        # Detect department header: e.g. "ACT: Accounting"
-        dept_match = re.match(r'^([A-Z]{2,6}):\s*(.+)$', stripped)
-        if dept_match:
-            flush()  # flush previous course if any
-            current_dept = dept_match.group(1)
-            current_dept_name = dept_match.group(2).strip()
-            in_courses_section = True
-            i += 1
-            continue
-
-        # Detect end of course listings
-        if in_courses_section and re.match(
-            r'^(Appendix|Index|Faculty|Administration|Financial|Academic Policies|Accreditation)',
-            stripped, re.I
-        ):
-            in_courses_section = False
-            i += 1
-            continue
-
-        if not in_courses_section:
-            i += 1
-            continue
-
-        # Match full course line: code title (credits)
-        m = re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)\s+(.+?)\s*\((\d+(?:\.\d+)?)\)$', stripped)
-        if m:
-            flush()
-            dept          = m.group(1)
-            num           = m.group(2)
-            title         = m.group(3).strip()
-            credits_val   = m.group(4)
-            current_code  = f"{dept} {num}"
-            current_title = title
-            credits       = credits_val
-            if not current_dept:
-                current_dept = dept
-            i += 1
-            # Collect description until next course or department
-            while i < len(lines):
-                next_line = lines[i]
-                next_stripped = next_line.strip()
-                if not next_stripped:
-                    i += 1
-                    continue
-                if re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)\s+(.+?)\s*\((\d+(?:\.\d+)?)\)$', next_stripped) or \
-                   re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)$', next_stripped) or \
-                   re.match(r'^(.+?)\s*\((\d+(?:\.\d+)?)\)$', next_stripped) or \
-                   re.match(r'^([A-Z]{2,6}):\s*(.+)$', next_stripped) or \
-                   re.match(r'^(Appendix|Index|Faculty|Administration|Financial|Academic Policies|Accreditation)', next_stripped, re.I) or \
-                   "CHATHAM UNIVERSITY CATALOG" in next_stripped or re.match(r'^\d+$', next_stripped):
-                    break
-                desc_parts.append(next_stripped)
-                i += 1
-            continue
-
-        # Check for title (credits) line first, then code
-        m_title = re.match(r'^(.+?)\s*\((\d+(?:\.\d+)?)\)$', stripped)
-        if m_title:
-            flush()
-            title = m_title.group(1).strip()
-            credits_val = m_title.group(2)
-            current_title = title
-            credits = credits_val
-            i += 1
-            if i < len(lines):
-                next_line = lines[i]
-                next_stripped = next_line.strip()
-                m_code = re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)$', next_stripped)
-                if m_code:
-                    dept = m_code.group(1)
-                    num = m_code.group(2)
-                    current_code = f"{dept} {num}"
-                    if not current_dept:
-                        current_dept = dept
-                    i += 1
-                    # Collect description
-                    while i < len(lines):
-                        next_line2 = lines[i]
-                        next_stripped2 = next_line2.strip()
-                        if not next_stripped2:
-                            i += 1
-                            continue
-                        if re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)\s+(.+?)\s*\((\d+(?:\.\d+)?)\)$', next_stripped2) or \
-                           re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)$', next_stripped2) or \
-                           re.match(r'^(.+?)\s*\((\d+(?:\.\d+)?)\)$', next_stripped2) or \
-                           re.match(r'^([A-Z]{2,6}):\s*(.+)$', next_stripped2) or \
-                           re.match(r'^(Appendix|Index|Faculty|Administration|Financial|Academic Policies|Accreditation)', next_stripped2, re.I) or \
-                           "CHATHAM UNIVERSITY CATALOG" in next_stripped2 or re.match(r'^\d+$', next_stripped2):
-                            break
-                        desc_parts.append(next_stripped2)
-                        i += 1
-                else:
-                    # If not code, treat as description or skip
-                    pass
-            continue
-
-        # Check for code only line
-        m_code_only = re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)$', stripped)
-        if m_code_only:
-            flush()
-            dept = m_code_only.group(1)
-            num = m_code_only.group(2)
-            current_code = f"{dept} {num}"
-            if not current_dept:
-                current_dept = dept
-            i += 1
-            if i < len(lines):
-                next_line = lines[i]
-                next_stripped = next_line.strip()
-                m_title_next = re.match(r'^(.+?)\s*\((\d+(?:\.\d+)?)\)$', next_stripped)
-                if m_title_next:
-                    title = m_title_next.group(1).strip()
-                    credits_val = m_title_next.group(2)
-                    current_title = title
-                    credits = credits_val
-                    i += 1
-                    # Collect description
-                    while i < len(lines):
-                        next_line2 = lines[i]
-                        next_stripped2 = next_line2.strip()
-                        if not next_stripped2:
-                            i += 1
-                            continue
-                        if re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)\s+(.+?)\s*\((\d+(?:\.\d+)?)\)$', next_stripped2) or \
-                           re.match(r'^([A-Z]{2,6})\s*(\d{3,4}[A-Z]?)$', next_stripped2) or \
-                           re.match(r'^(.+?)\s*\((\d+(?:\.\d+)?)\)$', next_stripped2) or \
-                           re.match(r'^([A-Z]{2,6}):\s*(.+)$', next_stripped2) or \
-                           re.match(r'^(Appendix|Index|Faculty|Administration|Financial|Academic Policies|Accreditation)', next_stripped2, re.I) or \
-                           "CHATHAM UNIVERSITY CATALOG" in next_stripped2 or re.match(r'^\d+$', next_stripped2):
-                            break
-                        desc_parts.append(next_stripped2)
-                        i += 1
-                else:
-                    # If not title, treat as description or skip
-                    pass
-            continue
-
-        # If in courses section and have current course, add to description
-        if current_code or current_title:
-            if re.match(r'^\d+\s*$', stripped) or len(stripped) < 4 or "CHATHAM UNIVERSITY CATALOG" in stripped or re.match(r'^\d+$', stripped):
-                i += 1
-                continue
-            desc_parts.append(stripped)
-
-        i += 1
-
-    flush()
     return courses
 
 

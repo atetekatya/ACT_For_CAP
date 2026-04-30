@@ -129,8 +129,18 @@ os.makedirs("output", exist_ok=True)
 # Helpers
 # ─────────────────────────────────────────────────────────────────
 
+_COURSE_CODE_RE = re.compile(r'\b[A-Z]{2,6}[\s\-]?\d{2,4}[A-Z]?\b')
+
+
 def clean_text(text: str) -> str:
-    """Lowercase, strip digits/punctuation, remove academic noise."""
+    """
+    Lowercase, strip digits/punctuation, remove academic noise.
+
+    Strips course-code patterns (e.g. "ACCT 200", "MUAC100", "BL-150A") *before*
+    lowercasing so the alphabetic prefix doesn't survive as a junk token like
+    "muac" in the keyword frequency output.
+    """
+    text = _COURSE_CODE_RE.sub(' ', text)
     text = text.lower()
     text = re.sub(r'\d+', '', text)
     text = re.sub(r'[^a-z\s]', ' ', text)
@@ -199,6 +209,20 @@ def encode_texts(model, texts: list[str]) -> np.ndarray:
 def cosine_sim_matrix(embeddings_a: np.ndarray, embeddings_b: np.ndarray) -> np.ndarray:
     """Compute cosine similarity between two sets of embeddings."""
     return cosine_similarity(embeddings_a, embeddings_b)
+
+
+def semantic_composite(tfidf, sts, simdl):
+    """
+    Composite ranking score from context-aware methods only (STS + SIMDL).
+    TF-IDF is reported alongside but excluded from the composite — it captures
+    surface-level keyword overlap which inflates scores for boilerplate-heavy
+    descriptions. Falls back to TF-IDF only if both embedding methods are
+    unavailable (TF-IDF-only pipeline mode).
+    """
+    semantic = [s for s in (sts, simdl) if s is not None]
+    if semantic:
+        return statistics.mean(semantic)
+    return tfidf
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -276,11 +300,8 @@ def analyze_shu_redundancy(sts_model=None, simdl_model=None):
             "tfidf_score":      round(tfidf_score, 4),
             "sts_score":        round(sts_score, 4)   if sts_score   is not None else "",
             "simdl_score":      round(simdl_score, 4) if simdl_score is not None else "",
-            # Composite: average of available scores
-            "composite_score":  round(
-                statistics.mean([s for s in [tfidf_score, sts_score, simdl_score] if s is not None]),
-                4
-            ),
+            # Composite: STS + SIMDL only (context-aware). TF-IDF reported separately.
+            "composite_score":  round(semantic_composite(tfidf_score, sts_score, simdl_score), 4),
             "description_a":    a["description"][:300],
             "description_b":    b["description"][:300],
         }
@@ -368,14 +389,13 @@ def analyze_cross_institution(sts_model=None, simdl_model=None):
             sts_scores    = sts_sim[i]   if sts_sim   is not None else [None] * len(peer_courses)
             simdl_scores  = simdl_sim[i] if simdl_sim is not None else [None] * len(peer_courses)
 
-            # Composite score for ranking
+            # Composite ranking — context-aware methods only (STS + SIMDL).
             composite = []
             for j in range(len(peer_courses)):
                 s_tfidf  = float(tfidf_scores[j])
                 s_sts    = float(sts_scores[j])   if sts_scores[j]   is not None else None
                 s_simdl  = float(simdl_scores[j]) if simdl_scores[j] is not None else None
-                available = [s for s in [s_tfidf, s_sts, s_simdl] if s is not None]
-                composite.append(statistics.mean(available))
+                composite.append(semantic_composite(s_tfidf, s_sts, s_simdl))
 
             top_j = int(np.argmax(composite))
             comp_score = composite[top_j]
