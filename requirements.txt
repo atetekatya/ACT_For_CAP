@@ -26,3 +26,4 @@ pydantic
 pdfminer.six
 pytest
 bibtexparser
+

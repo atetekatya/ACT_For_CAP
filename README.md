@@ -49,7 +49,6 @@ An NLP-assisted pipeline that detects keyword redundancy within SHU's course cat
 3. **Install Dependencies**:
    ```bash
    pip install -r requirements.txt
-   pip install sentence-transformers 
    ```
 
 4. **Download Required NLP Models**:

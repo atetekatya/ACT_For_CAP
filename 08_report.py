@@ -13,7 +13,7 @@ Sections:
   - Methodology
 """
 
-import csv, json, os, statistics
+import csv, html, json, os, statistics
 from datetime import date
 
 REDUNDANCY_CSV  = "output/shu_redundant_pairs.csv"
@@ -178,13 +178,15 @@ def build_cross_table(rows: list[dict], stats: dict) -> str:
     for r in rows[:500]:
         sts_td   = f"<td>{score_cell(r.get('sts_score'),   high_t, very_high_t)}</td>" if has_sts   else ""
         simdl_td = f"<td>{score_cell(r.get('simdl_score'), high_t, very_high_t)}</td>" if has_simdl else ""
+        shu_desc = html.escape(r.get('shu_description', ''), quote=True)
+        peer_desc = html.escape(r.get('peer_description', ''), quote=True)
         body_rows.append(f"""
         <tr data-peer="{r['peer_institution']}">
           <td><code>{r['shu_code']}</code></td>
-          <td>{r['shu_title']}</td>
+          <td title="{shu_desc}">{r['shu_title']}</td>
           <td><span class="muted">{r['peer_institution']}</span></td>
           <td><code>{r['peer_code']}</code></td>
-          <td>{r['peer_title']}</td>
+          <td title="{peer_desc}">{r['peer_title']}</td>
           <td>{score_cell(r.get('tfidf_score'), high_t, very_high_t)}</td>
           {sts_td}
           {simdl_td}
@@ -263,9 +265,11 @@ def build_pivot_table(rows: list[dict], stats: dict) -> str:
         prev = entry.get(peer)
         if prev is None or score > prev["score"]:
             entry[peer] = {
-                "score":      score,
-                "peer_code":  r.get("peer_code", ""),
-                "peer_title": r.get("peer_title", ""),
+                "score":            score,
+                "peer_code":        r.get("peer_code", ""),
+                "peer_title":       r.get("peer_title", ""),
+                "shu_description":  r.get("shu_description", ""),
+                "peer_description": r.get("peer_description", ""),
             }
 
     # Build rows with average across peers that returned a match.
@@ -295,7 +299,12 @@ def build_pivot_table(rows: list[dict], stats: dict) -> str:
             else:
                 tip = f"{m['peer_code']} · {m['peer_title']}".replace('"', '&quot;')
                 peer_cells.append(
-                    f'<td title="{tip}">{score_cell(m["score"], high_t, very_high_t)}</td>'
+                    f'<td title="{tip}" '
+                    f'data-shu="{html.escape(m.get("shu_description", ""), quote=True)}" '
+                    f'data-peer="{html.escape(m.get("peer_description", ""), quote=True)}" '
+                    f'data-label="{html.escape(m["peer_code"] + " - " + m["peer_title"], quote=True)}" '
+                    f'onclick="showCourseDetail(this)">'
+                    f'{score_cell(m["score"], high_t, very_high_t)}</td>'
                 )
         body.append(f"""
         <tr>
@@ -669,6 +678,26 @@ def main():
     .note strong {{ color: var(--text); }}
     .note code {{ font-size: 0.95em; background: var(--card); }}
 
+    /* Modal */
+    .modal {{
+      display: none; position: fixed; z-index: 1000; left: 0; top: 0;
+      width: 100%; height: 100%; background-color: rgba(0,0,0,0.4);
+    }}
+    .modal.show {{ display: block; }}
+    .modal-content {{
+      background-color: var(--card); margin: 5% auto; padding: 28px 32px;
+      border-radius: 8px; max-width: 600px; box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+      max-height: 80vh; overflow-y: auto;
+    }}
+    .modal-close {{
+      color: var(--muted); float: right; font-size: 28px; font-weight: bold;
+      cursor: pointer; line-height: 1; transition: color 120ms;
+    }}
+    .modal-close:hover {{ color: var(--text); }}
+    .modal h3 {{ margin-top: 0; font-size: 1em; margin-bottom: 16px; }}
+    .modal p {{ margin-bottom: 14px; font-size: 0.875em; line-height: 1.6; }}
+    .modal strong {{ color: var(--text); font-weight: 600; }}
+
     /* Charts */
     .chart-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(420px,1fr)); gap: 16px; }}
     .chart-card {{
@@ -703,6 +732,16 @@ def main():
   <a href="#" onclick="showSection('analytics', this); return false;">Analytics</a>
   <a href="#" onclick="showSection('methodology', this); return false;">Methodology</a>
 </nav>
+
+<!-- ── MODAL ──────────────────────────────────────────────── -->
+<div id="courseModal" class="modal">
+  <div class="modal-content">
+    <span class="modal-close" onclick="closeCourseModal()">&times;</span>
+    <h3 id="modalLabel"></h3>
+    <p><strong>SHU description:</strong><br><span id="modalShuDesc"></span></p>
+    <p><strong>Peer description:</strong><br><span id="modalPeerDesc"></span></p>
+  </div>
+</div>
 
 <!-- ── SUMMARY ─────────────────────────────────────────────── -->
 <div id="summary" class="section visible">
@@ -849,6 +888,27 @@ def main():
   }}
 
   {keyword_chart_init}
+
+  function showCourseDetail(cell) {{
+    const modal = document.getElementById('courseModal');
+    if (!modal) return;
+    document.getElementById('modalLabel').textContent = cell.dataset.label;
+    document.getElementById('modalShuDesc').textContent = cell.dataset.shu;
+    document.getElementById('modalPeerDesc').textContent = cell.dataset.peer;
+    modal.classList.add('show');
+  }}
+
+  function closeCourseModal() {{
+    const modal = document.getElementById('courseModal');
+    if (modal) modal.classList.remove('show');
+  }}
+
+  window.onclick = function(event) {{
+    const modal = document.getElementById('courseModal');
+    if (event.target === modal) {{
+      modal.classList.remove('show');
+    }}
+  }}
 
   function sortTable(tableId, col) {{
     const table = document.getElementById(tableId);
