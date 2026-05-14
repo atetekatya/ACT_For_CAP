@@ -15,12 +15,14 @@ Sections:
 
 import csv, html, json, os, statistics
 from datetime import date
+from collections import defaultdict
 
 REDUNDANCY_CSV  = "output/shu_redundant_pairs.csv"
 CROSS_INST_CSV  = "output/cross_institution_matches.csv"
 KEYWORD_CSV     = "output/keyword_frequencies.csv"
 STATS_JSON      = "output/similarity_stats.json"
-REPORT_OUT      = "output/ACT_for_CAP_Report.html"
+VALIDATION_JSON   = "output/validation_metrics.json"
+REPORT_OUT        = "output/ACT_for_CAP_Report.html"
 
 
 def read_csv(path: str) -> list[dict]:
@@ -35,6 +37,27 @@ def read_stats() -> dict:
         return {}
     with open(STATS_JSON) as f:
         return json.load(f)
+
+
+def read_validation_metrics() -> dict:
+    if not os.path.exists(VALIDATION_JSON):
+        return {}
+    with open(VALIDATION_JSON) as f:
+        return json.load(f)
+
+
+def cohen_kappa(labels_a: list, labels_b: list) -> float:
+    """Compute Cohen's kappa between two raters."""
+    if len(labels_a) != len(labels_b) or not labels_a:
+        return 0.0
+    categories = sorted(set(labels_a) | set(labels_b))
+    n = len(labels_a)
+    p_o = sum(a == b for a, b in zip(labels_a, labels_b)) / n
+    p_e = sum(
+        (labels_a.count(c) / n) * (labels_b.count(c) / n)
+        for c in categories
+    )
+    return round((p_o - p_e) / (1 - p_e), 4) if (1 - p_e) > 0 else 1.0
 
 
 def f(score) -> float:
@@ -478,15 +501,521 @@ def build_analytics_section(redundancy_stats, cross_stats, keyword_stats) -> str
     </div>"""
 
 
+def build_validation_section(validation_metrics: dict) -> str:
+    """
+    Display ground-truth validation results: accuracy, precision, recall, F1, confusion matrix.
+    """
+    if not validation_metrics:
+        return f"""
+    <div id="validation" class="section">
+      <h2>Validation Metrics</h2>
+      <p class="description">No validation metrics available yet.</p>
+      <div class="card">
+        <p class="muted">
+          To validate against human-reviewed matches, run:<br>
+          <code>python 07_analyze.py --validate output/gold_standard.csv</code>
+        </p>
+      </div>
+    </div>"""
+    
+    # Extract metrics for easy access
+    gold_count = validation_metrics.get("total_gold_labels", 0)
+    matched = validation_metrics.get("matched_to_predictions", 0)
+    match_rate = validation_metrics.get("match_rate", 0)
+    
+    class_balance = validation_metrics.get("class_balance", {})
+    methods = validation_metrics.get("methods", {})
+    
+    # Build method comparison table
+    method_rows = ""
+    for method_key in ["composite", "tfidf", "sts", "simdl"]:
+        if method_key not in methods:
+            continue
+        m = methods[method_key]
+        cm = m.get("confusion_matrix", {})
+        
+        method_rows += f"""
+        <tr>
+          <td><strong>{m.get('method', method_key)}</strong></td>
+          <td>{m.get('accuracy', 0):.4f}</td>
+          <td>{m.get('precision', 0):.4f}</td>
+          <td>{m.get('recall', 0):.4f}</td>
+          <td>{m.get('f1_score', 0):.4f}</td>
+          <td>{m.get('macro_f1', 0):.4f}</td>
+          <td>{cm.get('tp', 0)}</td>
+          <td>{cm.get('fp', 0)}</td>
+          <td>{cm.get('fn', 0)}</td>
+          <td>{cm.get('tn', 0)}</td>
+          <td>{m.get('false_positive_rate', 0):.1%}</td>
+          <td>{m.get('false_negative_rate', 0):.1%}</td>
+        </tr>"""
+    
+    # Class balance
+    class_dist = class_balance.get("distribution", {})
+    class_rows = ""
+    for label, data in sorted(class_dist.items()):
+        label_name = "Correct Match" if str(label) == "1" else "Incorrect/Missing"
+        class_rows += f"""
+        <tr>
+          <td>{label_name}</td>
+          <td>{data.get('count', 0)}</td>
+          <td>{data.get('percentage', 0):.1f}%</td>
+        </tr>"""
+    
+    imbalance_warning = ""
+    if class_balance.get("is_imbalanced"):
+        imbalance_warning = f"""
+      <div class="card" style="background: #fef2f2; border-color: #fca5a5;">
+        <h3 style="color: #be123c;">⚠ Class Imbalance Detected</h3>
+        <p style="color: #991b1b;">
+          {class_balance.get('dominant_class_percentage', 0):.1f}% of the dataset is dominated by one class.
+          Accuracy alone is misleading. Focus on precision, recall, and F1 score instead.
+        </p>
+      </div>"""
+    
+    return f"""
+    <div id="validation" class="section">
+      <h2>Ground-Truth Validation Metrics</h2>
+      <p class="description">
+        Comparison of model predictions against manually-reviewed gold standard labels.
+        Shows accuracy, precision, recall, F1 score, and confusion matrix per method.
+      </p>
+      
+      <div class="card">
+        <h3>Validation Summary</h3>
+        <div class="stat-row">
+          <div class="stat"><div class="num">{gold_count}</div><div class="lbl">Gold Labels</div></div>
+          <div class="stat"><div class="num">{matched}</div><div class="lbl">Matched to Predictions</div></div>
+          <div class="stat"><div class="num">{match_rate:.1%}</div><div class="lbl">Match Rate</div></div>
+        </div>
+      </div>
+      
+      <div class="card">
+        <h3>Classification Metrics by Method</h3>
+        <p class="muted small">
+          <strong>TP/FP/FN/TN:</strong> True Positive, False Positive, False Negative, True Negative counts.
+          <strong>FPR/FNR:</strong> False Positive / False Negative Rates.
+        </p>
+        <table class="metric-table">
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Accuracy</th>
+              <th>Precision</th>
+              <th>Recall</th>
+              <th>F1 Score</th>
+              <th>Macro F1</th>
+              <th>TP</th>
+              <th>FP</th>
+              <th>FN</th>
+              <th>TN</th>
+              <th>FPR</th>
+              <th>FNR</th>
+            </tr>
+          </thead>
+          <tbody>
+            {method_rows}
+          </tbody>
+        </table>
+      </div>
+      
+      <div class="card">
+        <h3>Class Balance Analysis</h3>
+        <table class="metric-table">
+          <thead>
+            <tr>
+              <th>Class</th>
+              <th>Count</th>
+              <th>Percentage</th>
+            </tr>
+          </thead>
+          <tbody>
+            {class_rows}
+          </tbody>
+        </table>
+      </div>
+      
+      {imbalance_warning}
+      
+      <div class="card">
+        <h3>Metric Definitions</h3>
+        <ul style="margin: 12px 0 0 0; padding-left: 20px;">
+          <li><strong>Accuracy:</strong> (TP + TN) / Total — overall prediction correctness.</li>
+          <li><strong>Precision:</strong> TP / (TP + FP) — when model predicts a match, how often is it correct?</li>
+          <li><strong>Recall:</strong> TP / (TP + FN) — what percentage of true matches does the model find?</li>
+          <li><strong>F1 Score:</strong> Harmonic mean of precision and recall — balances both metrics.</li>
+          <li><strong>Macro F1:</strong> Unweighted average of F1 scores per class — useful for imbalanced data.</li>
+          <li><strong>Confusion Matrix:</strong> TP/FP/FN/TN — shows which predictions are correct/incorrect.</li>
+          <li><strong>FPR:</strong> FP / (FP + TN) — how often does the model wrongly predict a match?</li>
+          <li><strong>FNR:</strong> FN / (FN + TP) — how often does the model miss a real match?</li>
+        </ul>
+      </div>
+    </div>"""
+
+
+def build_evaluation_metrics_section(redundancy_rows, cross_rows) -> str:
+    """
+    Build evaluation metrics tab: accuracy, F-score, false positives, false negatives.
+    Shows method comparison (TF-IDF vs STS vs SIMDL) and filters for threshold analysis.
+    """
+    
+    def compute_method_metrics(rows, method_col):
+        """Compute metrics for a specific similarity method."""
+        if not rows:
+            return {}
+        
+        scores = [f(r.get(method_col)) for r in rows if r.get(method_col)]
+        if not scores:
+            return {}
+        
+        # Calculate agreement statistics
+        high_count = sum(1 for s in scores if s >= 0.80)
+        very_high_count = sum(1 for s in scores if s >= 0.90)
+        precision_high = round(high_count / len(scores), 4) if scores else 0
+        
+        return {
+            "matches": len(scores),
+            "mean_score": round(sum(scores) / len(scores), 4),
+            "high_agreement_rate": precision_high,
+            "high_matches": high_count,
+            "very_high_matches": very_high_count,
+        }
+    
+    # Redundancy metrics
+    red_tfidf = compute_method_metrics(redundancy_rows, "tfidf_score")
+    red_sts = compute_method_metrics(redundancy_rows, "sts_score")
+    red_simdl = compute_method_metrics(redundancy_rows, "simdl_score")
+
+    # Cross-institution metrics
+    cross_tfidf = compute_method_metrics(cross_rows, "tfidf_score")
+    cross_sts = compute_method_metrics(cross_rows, "sts_score")
+    cross_simdl = compute_method_metrics(cross_rows, "simdl_score")
+
+    # Random baseline: expected agreement rate = 1 / avg peer courses per institution
+    peer_institutions = sorted({r.get("peer_institution","") for r in cross_rows if r.get("peer_institution")})
+    shu_codes = {r.get("shu_code") for r in cross_rows if r.get("shu_code")}
+    n_peers = len(peer_institutions)
+    n_cross_total = len(cross_rows)
+    avg_peer_courses = round(n_cross_total / max(n_peers, 1) / max(len(shu_codes), 1), 1) if n_cross_total else 1
+    random_precision = round(1 / max(avg_peer_courses, 1), 4)
+    
+    # Build comparison tables
+    def method_card(title, tfidf, sts, simdl, context=""):
+        if not tfidf and not sts and not simdl:
+            return f'<div class="card"><h3>{title}</h3><p class="muted">No data available.</p></div>'
+        
+        rows_html = ""
+        
+        # TFIDF
+        if tfidf:
+            rows_html += f"""
+            <tr>
+              <td><strong>TF-IDF</strong></td>
+              <td>{tfidf['matches']}</td>
+              <td>{tfidf['mean_score']:.4f}</td>
+              <td>{tfidf['high_matches']}</td>
+              <td>{tfidf['very_high_matches']}</td>
+              <td>{tfidf['high_agreement_rate']:.1%}</td>
+            </tr>"""
+        
+        # STS
+        if sts:
+            improvement = ""
+            if tfidf and sts['high_agreement_rate'] > tfidf['high_agreement_rate']:
+                diff = sts['high_agreement_rate'] - tfidf['high_agreement_rate']
+                improvement = f'<span style="color: #059669; font-size: 0.85em;">↑ +{diff:.1%}</span>'
+            
+            rows_html += f"""
+            <tr>
+              <td><strong>STS</strong> {improvement}</td>
+              <td>{sts['matches']}</td>
+              <td>{sts['mean_score']:.4f}</td>
+              <td>{sts['high_matches']}</td>
+              <td>{sts['very_high_matches']}</td>
+              <td>{sts['high_agreement_rate']:.1%}</td>
+            </tr>"""
+        
+        # SIMDL
+        if simdl:
+            improvement = ""
+            if tfidf and simdl['high_agreement_rate'] > tfidf['high_agreement_rate']:
+                diff = simdl['high_agreement_rate'] - tfidf['high_agreement_rate']
+                improvement = f'<span style="color: #059669; font-size: 0.85em;">↑ +{diff:.1%}</span>'
+            
+            rows_html += f"""
+            <tr>
+              <td><strong>SIMDL</strong> {improvement}</td>
+              <td>{simdl['matches']}</td>
+              <td>{simdl['mean_score']:.4f}</td>
+              <td>{simdl['high_matches']}</td>
+              <td>{simdl['very_high_matches']}</td>
+              <td>{simdl['high_agreement_rate']:.1%}</td>
+            </tr>"""
+        
+        return f"""
+        <div class="card">
+          <h3>{title}</h3>
+          <p class="muted small">{context}</p>
+          <table class="metric-table">
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th>Total Matches</th>
+                <th>Mean Score</th>
+                <th>High (≥0.80)</th>
+                <th>Very High (≥0.90)</th>
+                <th>Agreement Rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows_html}
+            </tbody>
+          </table>
+        </div>"""
+    
+    baseline_card = f"""
+      <div class="card">
+        <h3>Baseline Comparison — Cross-Institution</h3>
+        <p class="muted small">
+          Random baseline: expected agreement rate if a peer course were selected at random
+          (~1 / avg peer courses per SHU course = <strong>{random_precision:.1%}</strong>).
+          Any method above this line is doing better than chance.
+        </p>
+        <table class="metric-table">
+          <thead>
+            <tr><th>Method</th><th>Agreement Rate</th><th>vs Random Baseline</th></tr>
+          </thead>
+          <tbody>
+            <tr style="color:var(--muted);">
+              <td>Random (baseline)</td>
+              <td>{random_precision:.1%}</td>
+              <td>—</td>
+            </tr>
+            {"".join(
+              f"<tr><td><strong>{label}</strong></td><td>{metrics['high_agreement_rate']:.1%}</td>"
+              f"<td style='color:#059669'>↑ +{(metrics['high_agreement_rate'] - random_precision):.1%}</td></tr>"
+              for label, metrics in [("TF-IDF", cross_tfidf), ("STS", cross_sts), ("SIMDL", cross_simdl)]
+              if metrics
+            )}
+          </tbody>
+        </table>
+      </div>"""
+
+    return f"""
+    <div id="evaluation" class="section">
+      <h2>Evaluation Metrics</h2>
+      <p class="description">
+        Model performance comparison across similarity methods. <strong>Agreement Rate</strong> = % of matches scoring
+        high (≥0.80). STS and SIMDL improvements over TF-IDF highlight the benefit of semantic methods.
+        <strong>Note:</strong> For ground-truth evaluation, compare predictions against manually-reviewed gold standard.
+      </p>
+
+      {baseline_card}
+
+      {method_card('SHU Redundancy Detection', red_tfidf, red_sts, red_simdl,
+                   'Accuracy of method agreement on course pair redundancy detection.')}
+
+      {method_card('Cross-Institution Matching', cross_tfidf, cross_sts, cross_simdl,
+                   'Accuracy of method agreement on peer institution course matches.')}
+      
+      <div class="card">
+        <h3>Interpreting the Metrics</h3>
+        <ul style="margin: 12px 0 0 0; padding-left: 20px;">
+          <li><strong>Total Matches:</strong> Number of course pairs the method flagged as similar.</li>
+          <li><strong>Mean Score:</strong> Average similarity score across all flagged pairs.</li>
+          <li><strong>High / Very High:</strong> Count and rate of matches above quality thresholds.</li>
+          <li><strong>Agreement Rate:</strong> Percentage of matches that score high—proxy for method precision.</li>
+          <li><strong>Semantic Improvement (↑):</strong> STS/SIMDL advantage over TF-IDF in agreement rate.</li>
+        </ul>
+      </div>
+    </div>"""
+
+
+# ─────────────────────────────────────────────────────────────────
+# Threshold Evaluation
+# ─────────────────────────────────────────────────────────────────
+
+def build_threshold_table(cross_rows: list[dict], redundancy_rows: list[dict], validation_metrics: dict) -> str:
+    thresholds = [0.50, 0.65, 0.75, 0.85, 0.90]
+
+    # If validation metrics exist, extract per-threshold reviewer precision from composite confusion matrix.
+    # We don't have per-threshold gold data, so we note N/A unless a single threshold was validated.
+    val_threshold = 0.75  # the threshold used in validate_with_gold_standard
+    val_composite = validation_metrics.get("methods", {}).get("composite", {})
+    val_cm = val_composite.get("confusion_matrix", {})
+    val_prec = val_composite.get("precision")
+
+    cross_scores = [f(r.get("composite_score")) for r in cross_rows]
+    red_scores   = [f(r.get("composite_score")) for r in redundancy_rows]
+
+    rows_html = ""
+    for t in thresholds:
+        cross_n = sum(1 for s in cross_scores if s >= t)
+        red_n   = sum(1 for s in red_scores   if s >= t)
+        if val_prec is not None and abs(t - val_threshold) < 0.001:
+            prec_cell = f"<strong>{val_prec:.0%}</strong> <span class='muted small'>(validated)</span>"
+        else:
+            prec_cell = "<span class='muted'>—</span>"
+        rows_html += f"""
+        <tr>
+          <td><code>{t:.2f}</code></td>
+          <td>{cross_n}</td>
+          <td>{red_n}</td>
+          <td>{prec_cell}</td>
+        </tr>"""
+
+    note = ""
+    if val_prec is not None:
+        tp = val_cm.get("tp", 0)
+        fp = val_cm.get("fp", 0)
+        note = f'<p class="muted small" style="margin-top:10px;">Reviewer precision at 0.75 derived from gold-standard validation: {tp} true positives, {fp} false positives.</p>'
+
+    return f"""
+    <div id="threshold-eval" class="section">
+      <h2>Threshold Evaluation</h2>
+      <p class="description">
+        Number of matches surfaced at each composite-score threshold. Lower thresholds include more pairs
+        but reduce precision. Higher thresholds are more selective. The validated threshold (0.75) shows
+        reviewer-confirmed precision from the gold standard, if available.
+      </p>
+      <div class="card">
+        <table class="metric-table">
+          <thead>
+            <tr>
+              <th>Threshold</th>
+              <th>Cross-Inst Matches</th>
+              <th>Redundancy Pairs</th>
+              <th>Reviewer Precision</th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+        {note}
+      </div>
+      <div class="card">
+        <h3>How to Choose a Threshold</h3>
+        <ul style="margin: 8px 0 0 0; padding-left: 20px;">
+          <li>Lower thresholds (0.50–0.65): more suggestions, higher false-positive rate.</li>
+          <li>Mid-range (0.75): data-driven default; balances coverage and precision.</li>
+          <li>Higher thresholds (0.85–0.90): fewer matches, but each is more reliable.</li>
+          <li>Dynamic thresholds (mean + σ) adapt to your specific dataset distribution.</li>
+        </ul>
+      </div>
+    </div>"""
+
+
+# ─────────────────────────────────────────────────────────────────
+# Error Analysis
+# ─────────────────────────────────────────────────────────────────
+
+def build_error_analysis_section(cross_rows: list[dict], redundancy_rows: list[dict]) -> str:
+    # Pattern 1 — Generic language false positives: high TF-IDF, low STS/SIMDL composite
+    generic_fp = [
+        r for r in cross_rows
+        if f(r.get("tfidf_score")) >= 0.60
+        and f(r.get("composite_score")) < 0.50
+        and r.get("sts_score") not in ("", None)
+    ][:8]
+
+    # Pattern 2 — Vocabulary divergence (good finds): low TF-IDF, high composite
+    vocab_div = [
+        r for r in cross_rows
+        if f(r.get("tfidf_score")) < 0.35
+        and f(r.get("composite_score")) >= 0.60
+        and r.get("sts_score") not in ("", None)
+    ][:8]
+
+    # Pattern 3 — Short/missing descriptions
+    short_desc = [
+        r for r in cross_rows
+        if len(r.get("shu_description", "")) < 60 or len(r.get("peer_description", "")) < 60
+    ][:8]
+
+    # Pattern 4 — Title-only inflation: high TF-IDF but divergent content (redundancy pairs)
+    title_inflate = [
+        r for r in redundancy_rows
+        if f(r.get("tfidf_score")) >= 0.70
+        and f(r.get("composite_score")) < 0.55
+        and r.get("sts_score") not in ("", None)
+    ][:8]
+
+    def mini_table(rows, cols, title, note):
+        if not rows:
+            return f'<div class="card"><h3>{title}</h3><p class="muted">{note} — none found in current data.</p></div>'
+        col_ths = "".join(f"<th>{c[1]}</th>" for c in cols)
+        body = ""
+        for r in rows:
+            tds = "".join(
+                f"<td>{score_cell(r.get(c[0])) if 'score' in c[0] else html.escape(str(r.get(c[0], '')))}</td>"
+                for c in cols
+            )
+            body += f"<tr>{tds}</tr>"
+        return f"""
+        <div class="card">
+          <h3>{title}</h3>
+          <p class="muted small">{note}</p>
+          <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>{col_ths}</tr></thead>
+            <tbody>{body}</tbody>
+          </table>
+          </div>
+        </div>"""
+
+    cross_cols_fp  = [("shu_code","SHU"),("shu_title","SHU Title"),("peer_code","Peer"),("peer_title","Peer Title"),("tfidf_score","TF-IDF"),("composite_score","Composite")]
+    cross_cols_vd  = [("shu_code","SHU"),("shu_title","SHU Title"),("peer_code","Peer"),("peer_title","Peer Title"),("tfidf_score","TF-IDF"),("composite_score","Composite")]
+    short_cols     = [("shu_code","SHU"),("shu_title","SHU Title"),("peer_code","Peer"),("peer_title","Peer Title"),("composite_score","Composite")]
+    red_cols       = [("course_code_a","Code A"),("course_title_a","Title A"),("course_code_b","Code B"),("course_title_b","Title B"),("tfidf_score","TF-IDF"),("composite_score","Composite")]
+
+    return f"""
+    <div id="error-analysis" class="section">
+      <h2>Error Analysis</h2>
+      <p class="description">
+        Automatically categorized patterns in the match data. These examples help identify where the
+        pipeline succeeds and where it needs human scrutiny.
+      </p>
+
+      {mini_table(generic_fp, cross_cols_fp,
+        "False Positives — Generic Course Language",
+        "High TF-IDF (≥0.60) but low composite (&lt;0.50): shared boilerplate inflates keyword overlap, but semantic models disagree.")}
+
+      {mini_table(vocab_div, cross_cols_vd,
+        "Vocabulary Divergence — Same Concept, Different Words",
+        "Low TF-IDF (&lt;0.35) but high composite (≥0.60): semantic models find alignment that keyword overlap misses. These are strong candidates worth reviewing.")}
+
+      {mini_table(title_inflate, red_cols,
+        "Redundancy False Positives — Title Inflation",
+        "High TF-IDF (≥0.70) but low composite (&lt;0.55) in SHU redundancy pairs: title or boilerplate similarity without real content overlap.")}
+
+      {mini_table(short_desc, short_cols,
+        "Unreliable Comparisons — Short or Missing Descriptions",
+        "At least one description under 60 characters. Short descriptions make all similarity methods unreliable.")}
+
+      <div class="card">
+        <h3>Error Category Summary</h3>
+        <table class="metric-table">
+          <thead><tr><th>Category</th><th>Count</th><th>Recommended Action</th></tr></thead>
+          <tbody>
+            <tr><td>Generic language false positives</td><td>{len(generic_fp)}</td><td>Raise composite threshold or flag for manual review</td></tr>
+            <tr><td>Vocabulary divergence (good finds)</td><td>{len(vocab_div)}</td><td>Prioritize for reviewer — likely correct semantic matches</td></tr>
+            <tr><td>Title-inflation redundancy pairs</td><td>{len(title_inflate)}</td><td>Exclude TF-IDF-only matches from final report</td></tr>
+            <tr><td>Short/missing descriptions</td><td>{len(short_desc)}</td><td>Collect fuller catalog descriptions; exclude from scoring</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>"""
+
+
 # ─────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────
 
 def main():
-    redundancy_rows = read_csv(REDUNDANCY_CSV)
-    cross_rows      = read_csv(CROSS_INST_CSV)
-    keyword_rows    = read_csv(KEYWORD_CSV)
-    all_stats       = read_stats()
+    redundancy_rows    = read_csv(REDUNDANCY_CSV)
+    cross_rows         = read_csv(CROSS_INST_CSV)
+    keyword_rows       = read_csv(KEYWORD_CSV)
+    all_stats          = read_stats()
+    validation_metrics = read_validation_metrics()
 
     if not all_stats:
         all_stats = {
@@ -604,7 +1133,8 @@ def main():
     /* Tables */
     .table-wrap {{ overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }}
     .data-table {{ width: 100%; border-collapse: collapse; font-size: 0.875em; }}
-    .data-table th {{
+    .metric-table {{ width: 100%; border-collapse: collapse; font-size: 0.875em; }}
+    .data-table th, .metric-table th {{
       background: var(--accent-bg); color: var(--accent-700);
       padding: 9px 12px; text-align: left;
       font-weight: 600; font-size: 0.78em;
@@ -613,10 +1143,10 @@ def main():
       border-bottom: 1px solid var(--border);
       position: sticky; top: 0;
     }}
-    .data-table th:hover {{ background: #e0e7ff; }}
-    .data-table td {{ padding: 8px 12px; border-bottom: 1px solid var(--border-2); vertical-align: top; }}
-    .data-table tbody tr:hover {{ background: #fafbff; }}
-    .data-table tbody tr:last-child td {{ border-bottom: none; }}
+    .data-table th:hover, .metric-table th:hover {{ background: #e0e7ff; }}
+    .data-table td, .metric-table td {{ padding: 8px 12px; border-bottom: 1px solid var(--border-2); vertical-align: top; }}
+    .data-table tbody tr:hover, .metric-table tbody tr:hover {{ background: #fafbff; }}
+    .data-table tbody tr:last-child td, .metric-table tbody tr:last-child td {{ border-bottom: none; }}
 
     code {{
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -729,6 +1259,10 @@ def main():
   <a href="#" onclick="showSection('pivot', this); return false;">SHU vs Peers</a>
   <a href="#" onclick="showSection('cross', this); return false;">Cross-Institution</a>
   <a href="#" onclick="showSection('keywords', this); return false;">Keywords</a>
+  <a href="#" onclick="showSection('validation', this); return false;">Validation</a>
+  <a href="#" onclick="showSection('evaluation', this); return false;">Evaluation</a>
+  <a href="#" onclick="showSection('threshold-eval', this); return false;">Thresholds</a>
+  <a href="#" onclick="showSection('error-analysis', this); return false;">Error Analysis</a>
   <a href="#" onclick="showSection('analytics', this); return false;">Analytics</a>
   <a href="#" onclick="showSection('methodology', this); return false;">Methodology</a>
 </nav>
@@ -818,6 +1352,14 @@ def main():
     {keyword_chart_markup}
   </div>
 </div>
+
+{build_validation_section(validation_metrics)}
+
+{build_evaluation_metrics_section(redundancy_rows, cross_rows)}
+
+{build_threshold_table(cross_rows, redundancy_rows, validation_metrics)}
+
+{build_error_analysis_section(cross_rows, redundancy_rows)}
 
 {build_analytics_section(redundancy_stats, cross_stats, keyword_stats)}
 

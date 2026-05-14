@@ -29,16 +29,20 @@ Two analyses:
      (consumed by 08_report.py to set dynamic bucket thresholds)
 """
 
-import sqlite3, csv, re, os, json
+import sqlite3, csv, re, os, json, sys
 from itertools import combinations
 from collections import defaultdict
 import statistics
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report
+)
+from scipy.stats import spearmanr
 import numpy as np
 
-# ── Optional deep learning imports ────────────────────────────────
 try:
     from sentence_transformers import SentenceTransformer
     STS_AVAILABLE = True
@@ -57,7 +61,7 @@ STATS_OUT           = "output/similarity_stats.json"
 SIMILARITY_THRESHOLD = 0.75   # TF-IDF flag threshold (per proposal)
 CROSS_MATCH_TOP_N    = 1      # Best match per peer institution
 
-# STS model — lightweight, ~80MB
+# STS model 
 STS_MODEL_NAME  = "paraphrase-MiniLM-L6-v2"
 # SIMDL model — stronger, ~420MB
 SIMDL_MODEL_NAME = "all-mpnet-base-v2"
@@ -223,6 +227,298 @@ def semantic_composite(tfidf, sts, simdl):
     if semantic:
         return statistics.mean(semantic)
     return tfidf
+
+
+# ─────────────────────────────────────────────────────────────────
+# Classification Metrics (for labeling tasks)
+# ─────────────────────────────────────────────────────────────────
+
+def compute_classification_metrics(y_true, y_pred, labels=None):
+    """
+    Compute comprehensive classification metrics: accuracy, precision, recall, F1, macro F1.
+    
+    Args:
+        y_true: Ground truth labels
+        y_pred: Predicted labels
+        labels: Optional list of label names for detailed reporting
+    
+    Returns:
+        dict with metrics:
+          - accuracy: overall percentage of correct predictions
+          - precision: when model predicts a label, how often it is right
+          - recall: how many true examples of label the model successfully finds
+          - f1_score: balance between precision and recall
+          - macro_f1: useful when labels are imbalanced (unweighted mean of per-label F1s)
+    """
+    metrics = {
+        "accuracy": round(accuracy_score(y_true, y_pred), 4),
+        "precision": round(precision_score(y_true, y_pred, average="weighted", zero_division=0), 4),
+        "recall": round(recall_score(y_true, y_pred, average="weighted", zero_division=0), 4),
+        "f1_score": round(f1_score(y_true, y_pred, average="weighted", zero_division=0), 4),
+        "macro_f1": round(f1_score(y_true, y_pred, average="macro", zero_division=0), 4),
+    }
+    return metrics
+
+
+def compute_confusion_matrix(y_true, y_pred, labels=None):
+    """
+    Compute and display confusion matrix.
+    Shows which labels the model confuses (false positives/negatives).
+    
+    Args:
+        y_true: Ground truth labels
+        y_pred: Predicted labels
+        labels: Optional list of label names for readable output
+    
+    Returns:
+        numpy array: confusion matrix
+    """
+    return confusion_matrix(y_true, y_pred, labels=labels)
+
+
+def compute_class_balance(y_true):
+    """
+    Analyze class balance in dataset.
+    Identifies if one category dominates (important for model evaluation).
+    
+    Args:
+        y_true: Ground truth labels
+    
+    Returns:
+        dict with class distribution:
+          - class_counts: count per label
+          - class_percentages: percentage per label
+          - is_imbalanced: True if any class > 80% of dataset
+          - dominant_class_pct: percentage of most common class
+    """
+    unique, counts = np.unique(y_true, return_counts=True)
+    total = len(y_true)
+    
+    class_dist = {}
+    for label, count in zip(unique, counts):
+        pct = round((count / total) * 100, 2)
+        class_dist[str(label)] = {"count": int(count), "percentage": pct}
+    
+    dominant_pct = (max(counts) / total) * 100
+    is_imbalanced = dominant_pct > 80
+    
+    return {
+        "class_distribution": class_dist,
+        "dominant_class_percentage": round(dominant_pct, 2),
+        "is_imbalanced": is_imbalanced,
+        "warning": "Avoid relying on accuracy alone! Weak model can look accurate by always predicting majority class." if is_imbalanced else None,
+    }
+
+
+def print_classification_report(y_true, y_pred, target_names=None):
+    """
+    Print a detailed classification report with per-label precision, recall, F1.
+    
+    Args:
+        y_true: Ground truth labels
+        y_pred: Predicted labels
+        target_names: Optional list of label names for readable output
+    """
+    return classification_report(y_true, y_pred, target_names=target_names, zero_division=0)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Ranking & Matching Evaluation Metrics (for course similarity)
+# ─────────────────────────────────────────────────────────────────
+
+def top1_match_accuracy(predicted_rankings, ground_truth_correct):
+    """
+    Top-1 match accuracy: percentage of predictions where highest-ranked match is correct.
+    
+    Args:
+        predicted_rankings: list of ranked match IDs per query (first = highest ranked)
+        ground_truth_correct: list of sets of correct matches (indices that are correct)
+    
+    Returns:
+        float: accuracy (0-1)
+    """
+    if not predicted_rankings:
+        return 0.0
+    correct = sum(1 for pred, true_set in zip(predicted_rankings, ground_truth_correct)
+                  if pred and pred[0] in true_set)
+    return round(correct / len(predicted_rankings), 4)
+
+
+def precision_at_k(predicted_rankings, ground_truth_correct, k=10):
+    """
+    Precision@K: among top K suggestions, percentage that reviewers consider relevant.
+    
+    Args:
+        predicted_rankings: list of ranked match IDs per query
+        ground_truth_correct: list of sets of correct match indices
+        k: cutoff rank
+    
+    Returns:
+        dict: precision at each rank 1..k
+    """
+    precisions = {i: [] for i in range(1, k+1)}
+    
+    for pred, true_set in zip(predicted_rankings, ground_truth_correct):
+        for i in range(1, min(k+1, len(pred)+1)):
+            top_i = set(pred[:i])
+            relevant = len(top_i & true_set)
+            precisions[i].append(relevant / i)
+    
+    return {i: round(statistics.mean(prec), 4) if prec else 0.0 
+            for i, prec in precisions.items()}
+
+
+def recall_at_k(predicted_rankings, ground_truth_correct, k=10):
+    """
+    Recall@K: percentage of known relevant matches appearing in top K.
+    
+    Args:
+        predicted_rankings: list of ranked match IDs per query
+        ground_truth_correct: list of sets of correct match indices
+        k: cutoff rank
+    
+    Returns:
+        dict: recall at each rank 1..k
+    """
+    recalls = {i: [] for i in range(1, k+1)}
+    
+    for pred, true_set in zip(predicted_rankings, ground_truth_correct):
+        if not true_set:
+            continue
+        for i in range(1, min(k+1, len(pred)+1)):
+            top_i = set(pred[:i])
+            relevant = len(top_i & true_set)
+            recalls[i].append(relevant / len(true_set))
+    
+    return {i: round(statistics.mean(recall), 4) if recall else 0.0 
+            for i, recall in recalls.items()}
+
+
+def mean_reciprocal_rank(predicted_rankings, ground_truth_correct):
+    """
+    Mean Reciprocal Rank: rewards system when first correct match appears near top.
+    Reciprocal rank = 1 / (position of first correct match).
+    
+    Args:
+        predicted_rankings: list of ranked match IDs per query
+        ground_truth_correct: list of sets of correct match indices
+    
+    Returns:
+        float: MRR (0-1)
+    """
+    rr_list = []
+    
+    for pred, true_set in zip(predicted_rankings, ground_truth_correct):
+        if not true_set:
+            continue
+        for rank, match_id in enumerate(pred, 1):
+            if match_id in true_set:
+                rr_list.append(1.0 / rank)
+                break
+        else:
+            # No correct match found in ranking
+            rr_list.append(0.0)
+    
+    if not rr_list:
+        return 0.0
+    return round(statistics.mean(rr_list), 4)
+
+
+def spearman_rank_correlation(model_scores, human_scores):
+    """
+    Spearman rank correlation: compares model ranking vs human reviewer ranking.
+    Useful when reviewers score multiple candidates (e.g., 1-5 relevance scale).
+    
+    Args:
+        model_scores: list of similarity scores from model
+        human_scores: list of human reviewer scores (same length)
+    
+    Returns:
+        dict: correlation coefficient and p-value
+    """
+    if len(model_scores) < 2 or len(human_scores) < 2:
+        return {"correlation": 0.0, "p_value": 1.0}
+    
+    corr, pval = spearmanr(model_scores, human_scores)
+    return {
+        "correlation": round(float(corr), 4) if not np.isnan(corr) else 0.0,
+        "p_value": round(float(pval), 4),
+    }
+
+
+def false_positive_rate(predicted_matches, ground_truth_correct, all_candidates):
+    """
+    False positive rate: how often model says two courses are similar when reviewer disagrees.
+    
+    Args:
+        predicted_matches: list of (query_idx, match_idx) pairs the model flagged
+        ground_truth_correct: set of (query_idx, match_idx) pairs that are actually correct
+        all_candidates: total number of possible (query, candidate) pairs
+    
+    Returns:
+        float: false positive rate (0-1)
+    """
+    predicted_set = set(predicted_matches)
+    correct_set = ground_truth_correct
+    
+    false_positives = len(predicted_set - correct_set)
+    if all_candidates == 0:
+        return 0.0
+    return round(false_positives / all_candidates, 4)
+
+
+def false_negative_rate(predicted_matches, ground_truth_correct, all_candidates):
+    """
+    False negative rate: examples where model missed a match a human thought was obvious.
+    
+    Args:
+        predicted_matches: list of (query_idx, match_idx) pairs the model flagged
+        ground_truth_correct: set of (query_idx, match_idx) pairs that are actually correct
+        all_candidates: total number of possible (query, candidate) pairs
+    
+    Returns:
+        float: false negative rate (0-1)
+    """
+    predicted_set = set(predicted_matches)
+    correct_set = ground_truth_correct
+    
+    false_negatives = len(correct_set - predicted_set)
+    if all_candidates == 0:
+        return 0.0
+    return round(false_negatives / all_candidates, 4)
+
+
+def compare_ranking_methods(tfidf_rankings, sts_rankings, simdl_rankings, ground_truth_correct):
+    """
+    Compare ranking quality across TF-IDF, STS, and SIMDL methods.
+    
+    Args:
+        tfidf_rankings: TF-IDF ranked matches per query
+        sts_rankings: STS ranked matches per query
+        simdl_rankings: SIMDL ranked matches per query
+        ground_truth_correct: ground truth correct matches
+    
+    Returns:
+        dict: MRR for each method, showing semantic improvement over TF-IDF
+    """
+    results = {}
+    
+    if tfidf_rankings:
+        results["tfidf_mrr"] = mean_reciprocal_rank(tfidf_rankings, ground_truth_correct)
+    if sts_rankings:
+        results["sts_mrr"] = mean_reciprocal_rank(sts_rankings, ground_truth_correct)
+    if simdl_rankings:
+        results["simdl_mrr"] = mean_reciprocal_rank(simdl_rankings, ground_truth_correct)
+    
+    # Show semantic improvement
+    if "tfidf_mrr" in results and "sts_mrr" in results:
+        results["sts_improvement"] = round(results["sts_mrr"] - results["tfidf_mrr"], 4)
+    if "tfidf_mrr" in results and "simdl_mrr" in results:
+        results["simdl_improvement"] = round(results["simdl_mrr"] - results["tfidf_mrr"], 4)
+    
+    return results
+
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -478,10 +774,193 @@ def analyze_keyword_frequencies():
 
 
 # ─────────────────────────────────────────────────────────────────
+# Validation (with gold standard)
+# ─────────────────────────────────────────────────────────────────
+
+def validate_with_gold_standard(gold_standard_path: str):
+    """
+    Load gold standard labels and compute classification metrics
+    against the model's predictions.
+    
+    Gold standard CSV columns:
+      shu_code, shu_title, peer_institution, peer_code, peer_title, is_correct
+    
+    Metrics computed:
+      - Accuracy, Precision, Recall, F1, Macro F1
+      - Confusion matrix
+      - Class balance analysis
+      - Per-method comparison (TF-IDF vs STS vs SIMDL)
+    """
+    if not os.path.exists(gold_standard_path):
+        print(f"✗ Gold standard not found: {gold_standard_path}")
+        return
+    
+    print(f"\n── Validation with Gold Standard ──")
+    print(f"  Loading: {gold_standard_path}")
+    
+    # Load gold standard
+    gold_data = {}
+    with open(gold_standard_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = (row["shu_code"].strip(), row["peer_institution"].strip(), row["peer_code"].strip())
+            gold_data[key] = int(row["is_correct"])
+    
+    print(f"  Loaded {len(gold_data)} gold standard labels")
+    
+    # Load predictions from cross-institution matches
+    cross_rows = []
+    if os.path.exists(CROSS_INST_OUT):
+        with open(CROSS_INST_OUT, newline="", encoding="utf-8") as f:
+            cross_rows = list(csv.DictReader(f))
+    
+    if not cross_rows:
+        print("  ✗ No cross-institution predictions found. Run main analysis first.")
+        return
+    
+    # Build prediction set: (shu_code, peer_institution, peer_code) -> predicted_score
+    predictions = {}
+    for row in cross_rows:
+        key = (row["shu_code"].strip(), row["peer_institution"].strip(), row["peer_code"].strip())
+        predictions[key] = {
+            "composite": float(row.get("composite_score", 0)),
+            "tfidf": float(row.get("tfidf_score", 0)),
+            "sts": float(row.get("sts_score") or 0),
+            "simdl": float(row.get("simdl_score") or 0),
+        }
+    
+    # Match predictions to gold standard
+    y_true = []
+    y_pred_composite = []
+    y_pred_tfidf = []
+    y_pred_sts = []
+    y_pred_simdl = []
+    matched_count = 0
+    
+    for key, gold_label in gold_data.items():
+        if key in predictions:
+            matched_count += 1
+            y_true.append(gold_label)
+            # Threshold: composite >= 0.75 is predicted as 1 (match), else 0
+            y_pred_composite.append(1 if predictions[key]["composite"] >= 0.75 else 0)
+            y_pred_tfidf.append(1 if predictions[key]["tfidf"] >= 0.75 else 0)
+            y_pred_sts.append(1 if predictions[key]["sts"] >= 0.75 else 0)
+            y_pred_simdl.append(1 if predictions[key]["simdl"] >= 0.75 else 0)
+    
+    print(f"  Matched {matched_count}/{len(gold_data)} gold labels to predictions")
+    
+    if matched_count == 0:
+        print("  ✗ No matches between gold standard and predictions.")
+        return
+    
+    # Compute metrics for each method
+    def compute_method_metrics(y_t, y_p, method_name):
+        acc = round(accuracy_score(y_t, y_p), 4)
+        prec = round(precision_score(y_t, y_p, zero_division=0), 4)
+        rec = round(recall_score(y_t, y_p, zero_division=0), 4)
+        f1 = round(f1_score(y_t, y_p, zero_division=0), 4)
+        
+        macro_f1 = round(f1_score(y_t, y_p, average="macro", zero_division=0), 4)
+        
+        # Confusion matrix: [[TN, FP], [FN, TP]]
+        cm = confusion_matrix(y_t, y_p, labels=[0, 1])
+        tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+        fpr = round(fp / (fp + tn), 4) if (fp + tn) > 0 else 0
+        fnr = round(fn / (fn + tp), 4) if (fn + tp) > 0 else 0
+        
+        return {
+            "method": method_name,
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1_score": f1,
+            "macro_f1": macro_f1,
+            "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+            "false_positive_rate": fpr,
+            "false_negative_rate": fnr,
+        }
+    
+    # Class balance
+    unique, counts = np.unique(y_true, return_counts=True)
+    class_dist = {}
+    for label, count in zip(unique, counts):
+        pct = round((count / len(y_true)) * 100, 2)
+        class_dist[int(label)] = {"count": int(count), "percentage": pct}
+    
+    dominant_pct = round((max(counts) / len(y_true)) * 100, 2)
+    is_imbalanced = dominant_pct > 80
+    
+    # Assemble all metrics
+    metrics = {
+        "validation_date": str(pd.Timestamp.now().date()) if 'pd' in dir() else str(np.datetime64('today')),
+        "gold_standard_file": gold_standard_path,
+        "total_gold_labels": len(gold_data),
+        "matched_to_predictions": matched_count,
+        "match_rate": round(matched_count / len(gold_data), 4),
+        
+        "class_balance": {
+            "distribution": class_dist,
+            "dominant_class_percentage": dominant_pct,
+            "is_imbalanced": is_imbalanced,
+            "warning": "Avoid relying on accuracy alone! Weak model can look accurate by always predicting majority class." if is_imbalanced else None,
+        },
+        
+        "methods": {
+            "composite": compute_method_metrics(y_true, y_pred_composite, "Composite (STS+SIMDL)"),
+            "tfidf": compute_method_metrics(y_true, y_pred_tfidf, "TF-IDF"),
+            "sts": compute_method_metrics(y_true, y_pred_sts, "STS"),
+            "simdl": compute_method_metrics(y_true, y_pred_simdl, "SIMDL"),
+        }
+    }
+    
+    # Save metrics
+    VALIDATION_OUT = "output/validation_metrics.json"
+    with open(VALIDATION_OUT, "w") as f:
+        json.dump(metrics, f, indent=2)
+    
+    print(f"\n  ✅ Validation metrics saved → {VALIDATION_OUT}")
+    
+    # Print summary
+    comp_metrics = metrics["methods"]["composite"]
+    print(f"\n  ┌─ Composite Method Summary ─────────────────────────┐")
+    print(f"  │ Accuracy:        {comp_metrics['accuracy']}")
+    print(f"  │ Precision:       {comp_metrics['precision']}")
+    print(f"  │ Recall:          {comp_metrics['recall']}")
+    print(f"  │ F1 Score:        {comp_metrics['f1_score']}")
+    print(f"  │ Macro F1:        {comp_metrics['macro_f1']}")
+    print(f"  │")
+    cm = comp_metrics['confusion_matrix']
+    print(f"  │ Confusion Matrix:")
+    print(f"  │   True Neg:      {cm['tn']}    False Pos:    {cm['fp']}")
+    print(f"  │   False Neg:     {cm['fn']}    True Pos:     {cm['tp']}")
+    print(f"  │")
+    print(f"  │ False Positive Rate: {comp_metrics['false_positive_rate']:.1%}")
+    print(f"  │ False Negative Rate: {comp_metrics['false_negative_rate']:.1%}")
+    print(f"  │")
+    balance = metrics["class_balance"]
+    print(f"  │ Class Balance: {balance['distribution']}")
+    if balance['is_imbalanced']:
+        print(f"  │ ⚠  IMBALANCED: {balance['dominant_class_percentage']}% dominated by one class")
+    print(f"  └─────────────────────────────────────────────────────┘")
+
+
+
+# ─────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────
 
 def main():
+    # Parse command-line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description="ACT for CAP NLP analysis pipeline")
+    parser.add_argument("--validate", type=str, help="Path to gold standard CSV for validation")
+    args = parser.parse_args()
+    
+    if args.validate:
+        # Validation mode only
+        validate_with_gold_standard(args.validate)
+        return
+    
     if not os.path.exists(DB_PATH):
         print(f"✗ Database not found at {DB_PATH}. Run 06_build_database.py first.")
         return

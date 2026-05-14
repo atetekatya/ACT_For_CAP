@@ -314,8 +314,3 @@ The pipeline uses default settings but can be customized by modifying the indivi
 ### Debug Mode
 
 Run individual scripts with debug output to troubleshoot issues.
-
-
-## License
-
-MIT License
